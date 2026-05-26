@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+*.xcodeproj/
+DerivedData/
+
+# Built app bundles can contain local binaries, signatures, and bundled tools.
+*.app/
+
+# Local user config lives outside the repo at:
+# ~/Library/Application Support/Apex5Connect/config.json
