@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.hid
 import SwiftUI
 
 private let exampleControllerAddress = "00:11:22:33:44:55"
@@ -8,6 +9,7 @@ private let appSupportDirectoryURL = FileManager.default.homeDirectoryForCurrent
 private let configURL = appSupportDirectoryURL.appendingPathComponent("config.json")
 private let logURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Logs/Apex5Connect.log")
+private let popoverContentSize = NSSize(width: 420, height: 424)
 
 @main
 struct Apex5ConnectApp {
@@ -22,9 +24,16 @@ struct Apex5ConnectApp {
 
 @MainActor
 final class ConnectionModel: ObservableObject {
+    enum Operation {
+        case reconnect
+        case unregister
+        case statusCheck
+    }
+
     enum Phase {
         case idle
         case working
+        case bluetoothOnly
         case connected
         case failed
 
@@ -32,6 +41,7 @@ final class ConnectionModel: ObservableObject {
             switch self {
             case .idle: "待機中"
             case .working: "接続処理中"
+            case .bluetoothOnly: "Bluetoothのみ接続"
             case .connected: "接続済み"
             case .failed: "接続失敗"
             }
@@ -42,6 +52,7 @@ final class ConnectionModel: ObservableObject {
     @Published var status = "APEX5をペアリングモードにしてから、ペアリングし直してください。"
     @Published var detail = "アプリは終了せず、メニューバーからいつでも実行できます。"
     @Published var isRunning = false
+    @Published private(set) var currentOperation: Operation?
     @Published var controllerAddress: String {
         didSet {
             configStore.save(controllerAddress: Self.normalizedAddress(controllerAddress))
@@ -51,6 +62,7 @@ final class ConnectionModel: ObservableObject {
 
     private let runner = BlueutilRunner(logURL: logURL)
     private let configStore = ConfigStore(configURL: configURL)
+    private var operationTask: Task<Void, Never>?
 
     init() {
         controllerAddress = Self.normalizedAddress(configStore.loadControllerAddress())
@@ -68,12 +80,13 @@ final class ConnectionModel: ObservableObject {
         }
 
         isRunning = true
+        currentOperation = .reconnect
         phase = .working
         onPhaseChanged?(phase)
         status = "Bluetooth状態を確認中..."
         detail = "APEX5側はペアリングモードのままにしてください。"
 
-        Task {
+        operationTask = Task {
             do {
                 try await runner.repairAndConnect(controllerAddress: controllerAddress) { message in
                     Task { @MainActor in
@@ -84,14 +97,70 @@ final class ConnectionModel: ObservableObject {
                 onPhaseChanged?(phase)
                 status = "APEX5に接続しました。"
                 detail = "次に切断したら、APEX5をペアリングモードにしてからもう一度実行してください。"
+            } catch is CancellationError {
+                phase = .idle
+                onPhaseChanged?(phase)
+                status = "接続処理を中止しました。"
+                detail = "必要ならAPEX5をペアリングモードにしてから再実行してください。"
             } catch {
                 phase = .failed
                 onPhaseChanged?(phase)
                 status = "接続できませんでした。"
                 detail = error.localizedDescription
             }
-            isRunning = false
+            finishOperation()
         }
+    }
+
+    func unregister() {
+        guard !isRunning else { return }
+        controllerAddress = Self.normalizedAddress(controllerAddress)
+        guard isValidAddress else {
+            phase = .failed
+            status = "MACアドレスの形式が正しくありません。"
+            detail = "例: \(exampleControllerAddress)"
+            onPhaseChanged?(phase)
+            return
+        }
+
+        isRunning = true
+        currentOperation = .unregister
+        phase = .working
+        onPhaseChanged?(phase)
+        status = "Mac側の登録情報を削除中..."
+        detail = "APEX5のBluetooth登録を解除しています。"
+
+        operationTask = Task {
+            do {
+                try await runner.unregister(controllerAddress: controllerAddress) { message in
+                    Task { @MainActor in
+                        self.status = message
+                    }
+                }
+                phase = .idle
+                onPhaseChanged?(phase)
+                status = "登録を解除しました。"
+                detail = "APEX5を使うには、ペアリングモードにしてから再接続してください。"
+            } catch is CancellationError {
+                phase = .idle
+                onPhaseChanged?(phase)
+                status = "登録解除を中止しました。"
+                detail = ""
+            } catch {
+                phase = .failed
+                onPhaseChanged?(phase)
+                status = "登録解除できませんでした。"
+                detail = error.localizedDescription
+            }
+            finishOperation()
+        }
+    }
+
+    func cancelConnection() {
+        guard currentOperation == .reconnect else { return }
+        status = "接続処理を中止しています..."
+        detail = "実行中のblueutilコマンドを終了しています。"
+        operationTask?.cancel()
     }
 
     func checkStatus() {
@@ -106,25 +175,26 @@ final class ConnectionModel: ObservableObject {
         }
 
         isRunning = true
+        currentOperation = .statusCheck
         phase = .working
         onPhaseChanged?(phase)
         status = "接続状態を確認中..."
         detail = ""
 
-        Task {
+        operationTask = Task {
             do {
-                let connected = try await runner.isConnected(controllerAddress: controllerAddress)
-                phase = connected ? .connected : .idle
+                let connectionStatus = try await runner.connectionStatus(controllerAddress: controllerAddress)
+                phase = connectionStatus.phase
                 onPhaseChanged?(phase)
-                status = connected ? "APEX5は接続済みです。" : "APEX5は未接続です。"
-                detail = connected ? "切断問題が出た場合は、登録削除からペアリングし直してください。" : "APEX5をペアリングモードにしてからペアリングし直してください。"
+                status = connectionStatus.status
+                detail = connectionStatus.detail
             } catch {
                 phase = .failed
                 onPhaseChanged?(phase)
                 status = "状態を確認できませんでした。"
                 detail = error.localizedDescription
             }
-            isRunning = false
+            finishOperation()
         }
     }
 
@@ -143,10 +213,10 @@ final class ConnectionModel: ObservableObject {
 
         Task {
             do {
-                let connected = try await runner.isConnected(controllerAddress: controllerAddress, logOutput: false)
-                phase = connected ? .connected : .idle
-                status = connected ? "APEX5は接続済みです。" : "APEX5は未接続です。"
-                detail = connected ? "接続状態は自動確認されています。" : "APEX5をペアリングモードにしてからペアリングし直してください。"
+                let connectionStatus = try await runner.connectionStatus(controllerAddress: controllerAddress, logOutput: false)
+                phase = connectionStatus.phase
+                status = connectionStatus.status
+                detail = connectionStatus.detail
             } catch {
                 phase = .failed
                 status = "状態を確認できませんでした。"
@@ -158,6 +228,16 @@ final class ConnectionModel: ObservableObject {
 
     var isValidAddress: Bool {
         Self.isValidAddress(controllerAddress)
+    }
+
+    var canCancelConnection: Bool {
+        currentOperation == .reconnect
+    }
+
+    private func finishOperation() {
+        isRunning = false
+        currentOperation = nil
+        operationTask = nil
     }
 
     private static func normalizedAddress(_ address: String) -> String {
@@ -190,13 +270,13 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(model.status)
                     .font(.body)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
                 Text(model.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
             }
-            .frame(minHeight: 58, alignment: .topLeading)
+            .frame(height: 72, alignment: .topLeading)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("APEX5のMACアドレス")
@@ -211,6 +291,7 @@ struct ContentView: View {
                         .foregroundStyle(.red)
                 }
             }
+            .frame(height: 72, alignment: .topLeading)
 
             Button {
                 model.reconnect()
@@ -228,6 +309,23 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(model.isRunning || !model.isValidAddress)
+
+            HStack {
+                Button {
+                    model.unregister()
+                } label: {
+                    Label("登録解除", systemImage: "trash")
+                }
+                .disabled(model.isRunning || !model.isValidAddress)
+
+                Button {
+                    model.cancelConnection()
+                } label: {
+                    Label("接続処理を中止", systemImage: "xmark.circle")
+                }
+                .disabled(!model.canCancelConnection)
+            }
+            .buttonStyle(.bordered)
 
             HStack {
                 Button {
@@ -253,8 +351,9 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
         }
-        .padding(18)
-        .frame(width: 360)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 20)
+        .frame(width: popoverContentSize.width, height: popoverContentSize.height, alignment: .topLeading)
     }
 
     @ViewBuilder
@@ -262,6 +361,7 @@ struct ContentView: View {
         let color: Color = switch model.phase {
         case .idle: .secondary
         case .working: .orange
+        case .bluetoothOnly: .yellow
         case .connected: .green
         case .failed: .red
         }
@@ -292,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updateStatusItem(for: model.phase)
 
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 360, height: 340)
+        popover.contentSize = popoverContentSize
         popover.contentViewController = NSHostingController(rootView: ContentView(model: model))
         popover.delegate = self
 
@@ -333,6 +433,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .working:
             symbolName = "arrow.triangle.2.circlepath"
             tooltip = "APEX5: 処理中"
+        case .bluetoothOnly:
+            symbolName = "exclamationmark.triangle"
+            tooltip = "APEX5: Bluetoothのみ接続"
         case .connected:
             symbolName = "gamecontroller.fill"
             tooltip = "APEX5: 接続済み"
@@ -356,11 +459,29 @@ struct BlueutilRunner {
         try await ensureBluetoothPoweredOn()
 
         update("既存接続を確認中...")
-        if try await isConnected(controllerAddress: controllerAddress) {
-            appendLog("Already connected. Disconnecting first.")
-            update("既存接続を切断中...")
-            _ = try await runBlueutil(["--disconnect", controllerAddress])
-            try await Task.sleep(for: .seconds(1))
+        switch try await connectionStatus(controllerAddress: controllerAddress) {
+        case .hidBluetooth:
+            appendLog("Controller is already available as Bluetooth HID.")
+            update("APEX5はゲームコントローラーとして接続済みです。")
+            return
+        case .bluetoothOnly:
+            appendLog("Bluetooth link exists but HID controller is missing. Disconnecting stale link.")
+            update("Bluetoothのみ接続の状態を解除中...")
+            _ = try? await runBlueutil(["--disconnect", controllerAddress], timeout: 8)
+            try await Task.sleep(for: .seconds(2))
+        case .disconnected:
+            break
+        }
+
+        update("通常接続を試行中...")
+        do {
+            _ = try await runBlueutil(["--connect", controllerAddress], timeout: 12)
+            if try await waitForControllerReady(controllerAddress: controllerAddress, timeout: 6) {
+                appendLog("Controller connected without unpairing")
+                return
+            }
+        } catch {
+            appendLog("Initial connect failed: \(error.localizedDescription)")
         }
 
         update("Mac側の登録情報を削除中...")
@@ -370,13 +491,22 @@ struct BlueutilRunner {
             appendLog("Unpair failed or pair did not exist: \(error.localizedDescription)")
         }
 
-        try await Task.sleep(for: .seconds(1))
+        try await Task.sleep(for: .seconds(3))
 
         update("APEX5を新規ペアリング中...")
         for attempt in 1...5 {
             appendLog("Pair/connect attempt \(attempt)/5")
+            update("APEX5を検出中... \(attempt)/5")
             do {
-                _ = try await runBlueutil(["--pair", controllerAddress], timeout: 12)
+                appendLog("blueutil --inquiry 4")
+                _ = try await runBlueutil(["--inquiry", "4"], timeout: 8, logOutput: false)
+            } catch {
+                appendLog("Inquiry failed: \(error.localizedDescription)")
+            }
+
+            do {
+                update("APEX5を新規ペアリング中... \(attempt)/5")
+                _ = try await runBlueutil(["--pair", controllerAddress], timeout: 25)
             } catch {
                 appendLog("Pair command failed: \(error.localizedDescription)")
             }
@@ -384,27 +514,85 @@ struct BlueutilRunner {
             try await Task.sleep(for: .seconds(1))
 
             do {
-                _ = try await runBlueutil(["--connect", controllerAddress], timeout: 8)
+                update("APEX5へ接続中... \(attempt)/5")
+                _ = try await runBlueutil(["--connect", controllerAddress], timeout: 12)
             } catch {
                 appendLog("Connect command failed: \(error.localizedDescription)")
             }
 
-            try await Task.sleep(for: .seconds(2))
-            if try await isConnected(controllerAddress: controllerAddress) {
-                appendLog("Connected")
+            do {
+                _ = try await runBlueutil(["--wait-connect", controllerAddress, "6"], timeout: 8)
+            } catch {
+                appendLog("Wait-connect failed: \(error.localizedDescription)")
+            }
+
+            if try await waitForControllerReady(controllerAddress: controllerAddress, timeout: 6) {
+                appendLog("Controller connected")
                 return
             }
 
-            update("APEX5を新規ペアリング中... \(attempt)/5")
+            if try await isConnected(controllerAddress: controllerAddress) {
+                appendLog("Bluetooth connected but HID controller is still missing")
+                _ = try? await runBlueutil(["--disconnect", controllerAddress], timeout: 8)
+                try await Task.sleep(for: .seconds(2))
+            }
         }
 
         appendLog("Connection failed")
         throw AppError.connectionFailed(logURL.path)
     }
 
+    func unregister(controllerAddress: String, update: @escaping @Sendable (String) -> Void) async throws {
+        appendLog("Unregister flow started for \(maskedAddress(controllerAddress))")
+
+        update("Bluetooth接続を解除中...")
+        _ = try? await runBlueutil(["--disconnect", controllerAddress], timeout: 8)
+        try Task.checkCancellation()
+
+        update("Mac側の登録情報を削除中...")
+        _ = try await runBlueutil(["--unpair", controllerAddress])
+
+        appendLog("Unregister flow finished")
+    }
+
     func isConnected(controllerAddress: String, logOutput: Bool = true) async throws -> Bool {
         let output = try await runBlueutil(["--is-connected", controllerAddress], logOutput: logOutput).trimmingCharacters(in: .whitespacesAndNewlines)
         return output == "1"
+    }
+
+    func connectionStatus(controllerAddress: String, logOutput: Bool = true) async throws -> ControllerConnectionStatus {
+        let hidConnected = HIDControllerDetector.isBluetoothControllerConnected(address: controllerAddress)
+        if hidConnected {
+            if logOutput {
+                appendLog("IOHID Bluetooth controller matched \(maskedAddress(controllerAddress))")
+            }
+            return .hidBluetooth
+        }
+
+        do {
+            if try await isConnected(controllerAddress: controllerAddress, logOutput: logOutput) {
+                if logOutput {
+                    appendLog("Bluetooth connected but IOHID controller did not match \(maskedAddress(controllerAddress))")
+                }
+                return .bluetoothOnly
+            }
+        } catch {
+            throw error
+        }
+
+        return .disconnected
+    }
+
+    private func waitForControllerReady(controllerAddress: String, timeout: TimeInterval) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if try await connectionStatus(controllerAddress: controllerAddress, logOutput: false).isControllerReady {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(500))
+        } while Date() < deadline
+
+        return false
     }
 
     private func ensureBluetoothPoweredOn() async throws {
@@ -421,42 +609,55 @@ struct BlueutilRunner {
             appendLog("blueutil \(redactedArguments(arguments).joined(separator: " "))")
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            let completion = ProcessCompletion(continuation)
+        let processBox = RunningProcessBox()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                let process = Process()
+                let pipe = Pipe()
+                let completion = ProcessCompletion(continuation)
 
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = pipe
-            process.standardError = pipe
-            process.terminationHandler = { process in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                if logOutput {
-                    appendLog(output.trimmingCharacters(in: .whitespacesAndNewlines))
+                process.executableURL = executable
+                process.arguments = arguments
+                process.standardOutput = pipe
+                process.standardError = pipe
+                process.terminationHandler = { process in
+                    processBox.clear(process)
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(data: data, encoding: .utf8) ?? ""
+                    if logOutput {
+                        appendLog(output.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+
+                    if process.terminationStatus == 0 {
+                        completion.finish(.success(output))
+                    } else if processBox.isCancelled {
+                        completion.finish(.failure(CancellationError()))
+                    } else {
+                        completion.finish(.failure(AppError.commandFailed(output.isEmpty ? "blueutil failed" : output)))
+                    }
                 }
 
-                if process.terminationStatus == 0 {
-                    completion.finish(.success(output))
-                } else {
-                    completion.finish(.failure(AppError.commandFailed(output.isEmpty ? "blueutil failed" : output)))
-                }
-            }
-
-            do {
-                try process.run()
-                let workItem = DispatchWorkItem {
-                    if process.isRunning {
+                do {
+                    try process.run()
+                    processBox.set(process)
+                    if processBox.isCancelled, process.isRunning {
                         process.terminate()
                     }
-                    completion.finish(.failure(AppError.commandTimedOut(arguments.joined(separator: " "))))
+                    let workItem = DispatchWorkItem {
+                        if process.isRunning {
+                            process.terminate()
+                        }
+                        completion.finish(.failure(AppError.commandTimedOut(redactedArguments(arguments).joined(separator: " "))))
+                    }
+                    completion.setTimeoutWorkItem(workItem)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: workItem)
+                } catch {
+                    completion.finish(.failure(error))
                 }
-                completion.setTimeoutWorkItem(workItem)
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: workItem)
-            } catch {
-                completion.finish(.failure(error))
             }
+        } onCancel: {
+            processBox.terminate()
         }
     }
 
@@ -475,6 +676,143 @@ struct BlueutilRunner {
         }
 
         throw AppError.missingBlueutil
+    }
+}
+
+final class RunningProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var wasCancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return wasCancelled
+    }
+
+    func set(_ process: Process) {
+        lock.lock()
+        self.process = process
+        lock.unlock()
+    }
+
+    func clear(_ process: Process) {
+        lock.lock()
+        if self.process === process {
+            self.process = nil
+        }
+        lock.unlock()
+    }
+
+    func terminate() {
+        lock.lock()
+        wasCancelled = true
+        let process = process
+        lock.unlock()
+
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+    }
+}
+
+enum ControllerConnectionStatus {
+    case disconnected
+    case bluetoothOnly
+    case hidBluetooth
+
+    var isControllerReady: Bool {
+        switch self {
+        case .hidBluetooth:
+            true
+        case .disconnected, .bluetoothOnly:
+            false
+        }
+    }
+
+    var phase: ConnectionModel.Phase {
+        switch self {
+        case .disconnected:
+            .idle
+        case .bluetoothOnly:
+            .bluetoothOnly
+        case .hidBluetooth:
+            .connected
+        }
+    }
+
+    var status: String {
+        switch self {
+        case .disconnected:
+            "APEX5は未接続です。"
+        case .bluetoothOnly:
+            "APEX5はBluetoothのみ接続されています。"
+        case .hidBluetooth:
+            "APEX5は接続済みです。"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .disconnected:
+            "APEX5をペアリングモードにしてからペアリングし直してください。"
+        case .bluetoothOnly:
+            "ゲームコントローラーとして認識されていません。APEX5をペアリングモードにしてから修復を実行してください。"
+        case .hidBluetooth:
+            "Bluetooth HID入力として認識されています。"
+        }
+    }
+}
+
+struct HIDControllerDetector {
+    static func isBluetoothControllerConnected(address: String) -> Bool {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let matchingDictionaries: [[String: Int]] = [
+            [
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                kIOHIDDeviceUsageKey as String: kHIDUsage_GD_GamePad
+            ],
+            [
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Joystick
+            ],
+            [
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                kIOHIDDeviceUsageKey as String: kHIDUsage_GD_MultiAxisController
+            ]
+        ]
+
+        IOHIDManagerSetDeviceMatchingMultiple(manager, matchingDictionaries as CFArray)
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard openResult == kIOReturnSuccess else {
+            appendLog("IOHIDManagerOpen failed: \(openResult)")
+            return false
+        }
+        defer {
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+
+        guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+            return false
+        }
+
+        let normalizedTarget = normalizedAddress(address)
+        return devices.contains { device in
+            let transport = propertyString(kIOHIDTransportKey, for: device)
+            let serialNumber = propertyString(kIOHIDSerialNumberKey, for: device)
+            return transport == "Bluetooth" && normalizedAddress(serialNumber ?? "") == normalizedTarget
+        }
+    }
+
+    private static func propertyString(_ key: String, for device: IOHIDDevice) -> String? {
+        IOHIDDeviceGetProperty(device, key as CFString) as? String
+    }
+
+    private static func normalizedAddress(_ address: String) -> String {
+        address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: ":")
+            .uppercased()
     }
 }
 
